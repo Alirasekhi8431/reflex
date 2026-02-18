@@ -25,7 +25,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-// ---- Types (unchanged from Step 1) ----
+// ---- Types (unchanged) ----
 
 type Handler struct {
 	clients  []*protocol.MemoryUser
@@ -56,7 +56,7 @@ func (*Handler) Network() []net.Network {
 	return []net.Network{net.Network_TCP}
 }
 
-// ---- Registration (unchanged from Step 1) ----
+// ---- Registration (unchanged) ----
 
 func init() {
 	common.Must(common.RegisterConfig((*reflex.InboundConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
@@ -80,11 +80,120 @@ func New(ctx context.Context, config *reflex.InboundConfig) (proxy.Inbound, erro
 	return handler, nil
 }
 
-// ---- Step 2: Process with handshake ----
+// ============================================================
+// Step 4: Process with Peek-based protocol detection
+// ============================================================
+
+// reflexMinPeekSize is enough to see "POST /api/v1/data HTTP/1.1"
+// or a future magic number prefix.
+const reflexMinPeekSize = 64
 
 func (h *Handler) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	br := bufio.NewReader(conn)
 
+	// Peek without consuming bytes.
+	peeked, err := br.Peek(reflexMinPeekSize)
+	if err != nil && len(peeked) == 0 {
+		// Connection closed before we got any data.
+		return errors.New("reflex inbound: empty connection").Base(err)
+	}
+	// Note: Peek may return io.EOF with partial data on short connections — that's fine.
+
+	if isReflexHandshake(peeked) {
+		return h.handleReflex(ctx, br, conn, dispatcher)
+	}
+	return h.handleFallback(ctx, br, conn)
+}
+
+// ---- Protocol detection ----
+
+// isReflexHandshake returns true if the peeked bytes look like a Reflex handshake.
+// Two modes are supported:
+//  1. HTTP POST-like (stealth, used in production)
+//  2. Magic number prefix (fast path, optional future extension)
+func isReflexHandshake(data []byte) bool {
+	return isHTTPPostLike(data)
+	// To add magic number support later, change to:
+	// return isReflexMagic(data) || isHTTPPostLike(data)
+}
+
+// isHTTPPostLike checks if data starts with "POST /api/v1/data".
+// This is specific enough to avoid false positives from real HTTP traffic.
+func isHTTPPostLike(data []byte) bool {
+	const prefix = "POST /api/v1/data"
+	if len(data) < len(prefix) {
+		return false
+	}
+	return string(data[:len(prefix)]) == prefix
+}
+
+// isReflexMagic checks for the optional magic number prefix "REFX".
+// Not used by default (magic number reduces stealth).
+func isReflexMagic(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	return data[0] == 'R' && data[1] == 'E' && data[2] == 'F' && data[3] == 'X'
+}
+
+// ============================================================
+// Step 4: Fallback handler
+// ============================================================
+
+// preloadedConn wraps a bufio.Reader over a stat.Connection so that
+// peeked bytes are not lost when forwarding to the fallback server.
+type preloadedConn struct {
+	reader *bufio.Reader
+	stat.Connection
+}
+
+func (pc *preloadedConn) Read(b []byte) (int, error) {
+	return pc.reader.Read(b)
+}
+
+// handleFallback forwards the connection (including already-peeked bytes)
+// to the fallback port configured in InboundConfig.
+func (h *Handler) handleFallback(ctx context.Context, br *bufio.Reader, conn stat.Connection) error {
+	if h.fallback == nil {
+		// No fallback configured: send a plausible HTTP response and close.
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		return errors.New("reflex inbound: not a Reflex connection and no fallback configured")
+	}
+
+	// Dial the fallback server (typically nginx/caddy on localhost).
+	target, err := net.DialTCP("tcp", nil, &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: int(h.fallback.Dest),
+	})
+	if err != nil {
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+		return errors.New("reflex inbound: fallback dial failed to 127.0.0.1:", h.fallback.Dest).Base(err)
+	}
+	defer target.Close()
+
+	// Wrap conn with the bufio.Reader so peeked bytes are included.
+	wrapped := &preloadedConn{reader: br, Connection: conn}
+
+	// Bidirectional copy: wrapped ↔ target.
+	// We need both directions to finish before returning.
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(target, wrapped)
+		// Signal the target that we're done writing (triggers EOF on its reader).
+		target.CloseWrite()
+		done <- err
+	}()
+	io.Copy(wrapped, target)
+	<-done
+	return nil
+}
+
+// ============================================================
+// Reflex handshake + session (unchanged from Steps 2 & 3,
+// just renamed from the inline Process body to handleReflex)
+// ============================================================
+
+func (h *Handler) handleReflex(ctx context.Context, br *bufio.Reader, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	req, bodyBytes, err := readHTTPRequest(br)
 	if err != nil {
 		conn.Write([]byte(reflex.FallbackResponse))
@@ -118,8 +227,8 @@ func (h *Handler) Process(ctx context.Context, network net.Network, conn stat.Co
 
 	user, err := h.authenticateUser(clientPayload.UserID)
 	if err != nil {
-		conn.Write([]byte(reflex.FallbackResponse))
-		return errors.New("reflex inbound: auth failed").Base(err)
+		// Silent fallback — don't reveal auth failure.
+		return h.handleFallback(ctx, br, conn)
 	}
 
 	serverPriv, serverPub, err := reflex.GenerateKeyPair()
@@ -144,47 +253,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, conn stat.Co
 		return errors.New("reflex inbound: failed to send handshake response").Base(err)
 	}
 
-	// ↓ NOW passes sessionKey and user (Step 3)
 	return h.handleSession(ctx, br, conn, dispatcher, sessionKey, user)
 }
 
-// ---- Authentication ----
+// ---- Session (unchanged from Step 3) ----
 
-func (h *Handler) authenticateUser(userID [16]byte) (*protocol.MemoryUser, error) {
-	// Convert raw bytes to UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
-	b := userID
-	uuidStr := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-
-	for _, user := range h.clients {
-		if user.Account.(*MemoryAccount).Id == uuidStr {
-			return user, nil
-		}
-	}
-	return nil, errors.New("user not found: ", uuidStr)
-}
-
-// ---- Fallback ----
-
-func (h *Handler) handleFallback(ctx context.Context, conn stat.Connection) error {
-	if h.fallback == nil {
-		conn.Write([]byte(reflex.FallbackResponse))
-		return nil
-	}
-	// Forward to fallback port (simple TCP dial).
-	dest := net.TCPDestination(net.LocalHostIP, net.Port(h.fallback.Dest))
-	fconn, err := net.Dial("tcp", dest.NetAddr())
-	if err != nil {
-		conn.Write([]byte(reflex.FallbackResponse))
-		return errors.New("reflex inbound: fallback dial failed").Base(err)
-	}
-	defer fconn.Close()
-	go io.Copy(fconn, conn)
-	io.Copy(conn, fconn)
-	return nil
-}
-
-// ---- Session stub (filled in Step 3) ----
 func (h *Handler) handleSession(
 	ctx context.Context,
 	br *bufio.Reader,
@@ -198,8 +271,6 @@ func (h *Handler) handleSession(
 		return errors.New("reflex inbound: failed to create session").Base(err)
 	}
 
-	// The very first FrameTypeData carries the destination address.
-	// We use a flag to know when we've parsed it.
 	destParsed := false
 	var link *transport.Link
 
@@ -215,7 +286,6 @@ func (h *Handler) handleSession(
 		switch frame.Type {
 		case reflex.FrameTypeData:
 			if !destParsed {
-				// First data frame: parse destination + initial data.
 				addrType, addr, port, initialData, err := reflex.DecodeDestination(frame.Payload)
 				if err != nil {
 					return errors.New("reflex inbound: failed to decode destination").Base(err)
@@ -226,13 +296,11 @@ func (h *Handler) handleSession(
 				}
 				destParsed = true
 
-				// Dispatch to upstream.
 				link, err = dispatcher.Dispatch(ctx, dest)
 				if err != nil {
 					return errors.New("reflex inbound: dispatch failed").Base(err)
 				}
 
-				// Start goroutine: upstream → client (encrypted frames).
 				go func() {
 					defer common.Interrupt(link.Reader)
 					for {
@@ -250,15 +318,13 @@ func (h *Handler) handleSession(
 					}
 				}()
 
-				// Write initial data (if any) to upstream.
 				if len(initialData) > 0 {
-					buf := xbuf.FromBytes(initialData)
-					if err := link.Writer.WriteMultiBuffer(xbuf.MultiBuffer{buf}); err != nil {
+					b := xbuf.FromBytes(initialData)
+					if err := link.Writer.WriteMultiBuffer(xbuf.MultiBuffer{b}); err != nil {
 						return errors.New("reflex inbound: failed to write initial data").Base(err)
 					}
 				}
 			} else {
-				// Subsequent data frames: forward directly to upstream.
 				if link == nil {
 					return errors.New("reflex inbound: data frame before destination")
 				}
@@ -269,14 +335,12 @@ func (h *Handler) handleSession(
 			}
 
 		case reflex.FrameTypePadding, reflex.FrameTypeTiming:
-			// Ignore control frames for now (Step 5).
 			continue
 
 		case reflex.FrameTypeClose:
 			if link != nil {
 				common.Close(link.Writer)
 			}
-			// Send Close frame back to acknowledge.
 			_ = session.WriteFrame(conn, reflex.FrameTypeClose, nil)
 			return nil
 
@@ -286,7 +350,35 @@ func (h *Handler) handleSession(
 	}
 }
 
-// ---- Minimal HTTP/1.1 request reader ----
+// ---- Authentication (unchanged) ----
+
+func (h *Handler) authenticateUser(userID [16]byte) (*protocol.MemoryUser, error) {
+	b := userID
+	uuidStr := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	for _, user := range h.clients {
+		if user.Account.(*MemoryAccount).Id == uuidStr {
+			return user, nil
+		}
+	}
+	return nil, errors.New("user not found: ", uuidStr)
+}
+
+// ---- Destination builder (unchanged) ----
+
+func buildDestination(addrType uint8, addr []byte, port uint16) (net.Destination, error) {
+	netPort := net.Port(port)
+	switch addrType {
+	case reflex.AddrTypeIPv4, reflex.AddrTypeIPv6:
+		return net.TCPDestination(net.IPAddress(addr), netPort), nil
+	case reflex.AddrTypeDomain:
+		return net.TCPDestination(net.DomainAddress(string(addr)), netPort), nil
+	default:
+		return net.Destination{}, errors.New("unknown address type: ", addrType)
+	}
+}
+
+// ---- Minimal HTTP/1.1 request reader (unchanged) ----
 
 type parsedRequest struct {
 	method  string
@@ -295,7 +387,6 @@ type parsedRequest struct {
 }
 
 func readHTTPRequest(br *bufio.Reader) (*parsedRequest, []byte, error) {
-	// Read request line.
 	line, err := br.ReadString('\n')
 	if err != nil {
 		return nil, nil, err
@@ -304,15 +395,11 @@ func readHTTPRequest(br *bufio.Reader) (*parsedRequest, []byte, error) {
 	if _, err := fmt.Sscanf(line, "%s %s %s", &method, &path, &proto_); err != nil {
 		return nil, nil, fmt.Errorf("bad request line: %q", line)
 	}
-
-	// Read headers using net/textproto.
 	tr := textproto.NewReader(br)
 	headers, err := tr.ReadMIMEHeader()
 	if err != nil && err != io.EOF {
 		return nil, nil, fmt.Errorf("bad headers: %w", err)
 	}
-
-	// Read body (Content-Length bytes).
 	clStr := headers.Get("Content-Length")
 	if clStr == "" {
 		return nil, nil, fmt.Errorf("missing Content-Length")
@@ -325,23 +412,9 @@ func readHTTPRequest(br *bufio.Reader) (*parsedRequest, []byte, error) {
 	if _, err := io.ReadFull(br, body); err != nil {
 		return nil, nil, fmt.Errorf("failed to read body: %w", err)
 	}
-
 	return &parsedRequest{method: method, path: path, headers: headers}, body, nil
 }
 
-// Silence unused import if rand isn't used elsewhere yet.
+// Silence unused imports that are needed in other methods.
 var _ = rand.Reader
 var _ = json.Marshal
-
-func buildDestination(addrType uint8, addr []byte, port uint16) (net.Destination, error) {
-	netPort := net.Port(port)
-	switch addrType {
-	case reflex.AddrTypeIPv4, reflex.AddrTypeIPv6:
-		ip := net.IPAddress(addr)
-		return net.TCPDestination(ip, netPort), nil
-	case reflex.AddrTypeDomain:
-		return net.TCPDestination(net.DomainAddress(string(addr)), netPort), nil
-	default:
-		return net.Destination{}, errors.New("unknown address type: ", addrType)
-	}
-}
