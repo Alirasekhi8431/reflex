@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	session_pkg "github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/proxy/reflex"
@@ -99,27 +100,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 	defer conn.Close()
 
-	// --- Step 2: Send client handshake ---
-
-	// Generate ephemeral key pair.
+	// ---- Handshake (same as Step 2) ----
 	clientPriv, clientPub, err := reflex.GenerateKeyPair()
 	if err != nil {
 		return errors.New("reflex outbound: keygen failed").Base(err)
 	}
-
-	// Build ClientPayload.
 	payload := &reflex.ClientPayload{
 		PublicKey: clientPub,
 		Timestamp: time.Now().Unix(),
 	}
-	// Fill UserID from the handler's configured UUID.
 	copy(payload.UserID[:], uuidStringToBytes(h.server.User.Email))
-	// Random nonce.
 	if _, err := io.ReadFull(rand.Reader, payload.Nonce[:]); err != nil {
 		return errors.New("reflex outbound: nonce generation failed").Base(err)
 	}
 
-	// Wrap in HTTP POST and send.
 	reqBytes, err := reflex.WrapClientHTTP(payload, h.server.Destination.Address.String())
 	if err != nil {
 		return errors.New("reflex outbound: failed to encode handshake").Base(err)
@@ -128,20 +122,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("reflex outbound: failed to send handshake").Base(err)
 	}
 
-	// --- Read server HTTP 200 response ---
 	br := bufio.NewReader(conn)
 	serverPayloadBytes, err := readHTTPResponse(br)
 	if err != nil {
 		return errors.New("reflex outbound: failed to read server handshake").Base(err)
 	}
-
-	// Decode server public key.
 	serverPayload, err := reflex.DecodeServerPayload(serverPayloadBytes)
 	if err != nil {
 		return errors.New("reflex outbound: bad server payload").Base(err)
 	}
 
-	// DH + session key.
 	sharedKey, err := reflex.DeriveSharedKey(clientPriv, serverPayload.PublicKey)
 	if err != nil {
 		return errors.New("reflex outbound: DH failed").Base(err)
@@ -151,9 +141,73 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("reflex outbound: KDF failed").Base(err)
 	}
 
-	// Handshake done — hand off to session (Step 3 will use sessionKey).
-	_ = sessionKey
-	return pipeTraffic(conn, link)
+	// ---- Session (Step 3) ----
+	session, err := reflex.NewSession(sessionKey)
+	if err != nil {
+		return errors.New("reflex outbound: failed to create session").Base(err)
+	}
+
+	// Build the destination prefix for the first data frame.
+	// Extract target from the session context outbound info.
+	outbounds := session_pkg.OutboundsFromContext(ctx)
+	if len(outbounds) == 0 {
+		return errors.New("reflex outbound: no outbound context")
+	}
+	target := outbounds[len(outbounds)-1].Target
+	destBytes := encodeTarget(target)
+
+	// Goroutine: server → client (decrypt frames, write to link).
+	downlinkErr := make(chan error, 1)
+	go func() {
+		defer common.Interrupt(link.Writer)
+		for {
+			frame, err := session.ReadFrame(br)
+			if err != nil {
+				downlinkErr <- err
+				return
+			}
+			switch frame.Type {
+			case reflex.FrameTypeData:
+				b := buf.FromBytes(frame.Payload)
+				if err := link.Writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+					downlinkErr <- err
+					return
+				}
+			case reflex.FrameTypeClose:
+				downlinkErr <- nil
+				return
+			case reflex.FrameTypePadding, reflex.FrameTypeTiming:
+				// ignore
+			}
+		}
+	}()
+
+	// Uplink: client → server (read from link, encrypt frames).
+	firstFrame := true
+	for {
+		mb, err := link.Reader.ReadMultiBuffer()
+		if err != nil {
+			// Uplink done — send Close frame and wait for downlink.
+			_ = session.WriteFrame(conn, reflex.FrameTypeClose, nil)
+			return <-downlinkErr
+		}
+		for _, b := range mb {
+			var frameData []byte
+			if firstFrame {
+				// Prepend destination to the first frame's payload.
+				frameData = append(destBytes, b.Bytes()...)
+				firstFrame = false
+			} else {
+				frameData = b.Bytes()
+			}
+			if err := session.WriteFrame(conn, reflex.FrameTypeData, frameData); err != nil {
+				b.Release()
+				common.Interrupt(link.Reader)
+				return errors.New("reflex outbound: write frame failed").Base(err)
+			}
+			b.Release()
+		}
+	}
 }
 
 // pipeTraffic is a simple TCP bidirectional copy (placeholder until Step 3).
@@ -202,4 +256,18 @@ func hexVal(c byte) byte {
 		return c - 'A' + 10
 	}
 	return 0
+}
+
+func encodeTarget(dest net.Destination) []byte {
+	port := uint16(dest.Port)
+	addr := dest.Address
+	switch addr.Family() {
+	case net.AddressFamilyIPv4:
+		return reflex.EncodeDestination(reflex.AddrTypeIPv4, addr.IP().To4(), port)
+	case net.AddressFamilyIPv6:
+		return reflex.EncodeDestination(reflex.AddrTypeIPv6, addr.IP().To16(), port)
+	default: // domain
+		domain := []byte(addr.Domain())
+		return reflex.EncodeDestination(reflex.AddrTypeDomain, domain, port)
+	}
 }

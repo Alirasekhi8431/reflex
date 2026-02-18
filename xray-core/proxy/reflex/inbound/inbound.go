@@ -14,12 +14,14 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/xtls/xray-core/common"
+	xbuf "github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/reflex"
+	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -83,34 +85,27 @@ func New(ctx context.Context, config *reflex.InboundConfig) (proxy.Inbound, erro
 func (h *Handler) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	br := bufio.NewReader(conn)
 
-	// Parse the incoming HTTP POST request line + headers.
 	req, bodyBytes, err := readHTTPRequest(br)
 	if err != nil {
-		// Not valid HTTP at all — send fallback and close.
 		conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: not a valid HTTP request").Base(err)
 	}
-
-	// Must be POST /api/v1/data
 	if req.method != "POST" || req.path != "/api/v1/data" {
 		conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: unexpected method/path: ", req.method, " ", req.path)
 	}
 
-	// Decode base64 → binary ClientPayload.
 	rawPayload, err := reflex.UnwrapHTTPBody(bodyBytes)
 	if err != nil {
 		conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: bad handshake body").Base(err)
 	}
-
 	clientPayload, err := reflex.DecodeClientPayload(rawPayload)
 	if err != nil {
 		conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: bad client payload").Base(err)
 	}
 
-	// Replay protection: reject if timestamp is more than 120 seconds off.
 	now := time.Now().Unix()
 	diff := clientPayload.Timestamp - now
 	if diff < 0 {
@@ -121,21 +116,16 @@ func (h *Handler) Process(ctx context.Context, network net.Network, conn stat.Co
 		return errors.New("reflex inbound: timestamp too far off: ", diff, "s")
 	}
 
-	// Authenticate user by UUID bytes.
 	user, err := h.authenticateUser(clientPayload.UserID)
 	if err != nil {
-		// User not found — silent fallback (don't reveal why).
 		conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: auth failed").Base(err)
 	}
 
-	// Generate server ephemeral key pair.
 	serverPriv, serverPub, err := reflex.GenerateKeyPair()
 	if err != nil {
 		return errors.New("reflex inbound: keygen failed").Base(err)
 	}
-
-	// DH + session key derivation.
 	sharedKey, err := reflex.DeriveSharedKey(serverPriv, clientPayload.PublicKey)
 	if err != nil {
 		return errors.New("reflex inbound: DH failed").Base(err)
@@ -145,7 +135,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, conn stat.Co
 		return errors.New("reflex inbound: KDF failed").Base(err)
 	}
 
-	// Send HTTP 200 with server's public key.
 	serverPayload := &reflex.ServerPayload{PublicKey: serverPub}
 	respBytes, err := reflex.WrapServerHTTP(serverPayload)
 	if err != nil {
@@ -155,10 +144,8 @@ func (h *Handler) Process(ctx context.Context, network net.Network, conn stat.Co
 		return errors.New("reflex inbound: failed to send handshake response").Base(err)
 	}
 
-	// Handshake done — hand off to session handler (Step 3 will use sessionKey).
-	_ = user
-	_ = sessionKey
-	return h.handleSession(ctx, br, conn, dispatcher)
+	// ↓ NOW passes sessionKey and user (Step 3)
+	return h.handleSession(ctx, br, conn, dispatcher, sessionKey, user)
 }
 
 // ---- Authentication ----
@@ -198,10 +185,105 @@ func (h *Handler) handleFallback(ctx context.Context, conn stat.Connection) erro
 }
 
 // ---- Session stub (filled in Step 3) ----
+func (h *Handler) handleSession(
+	ctx context.Context,
+	br *bufio.Reader,
+	conn stat.Connection,
+	dispatcher routing.Dispatcher,
+	sessionKey []byte,
+	user *protocol.MemoryUser,
+) error {
+	session, err := reflex.NewSession(sessionKey)
+	if err != nil {
+		return errors.New("reflex inbound: failed to create session").Base(err)
+	}
 
-func (h *Handler) handleSession(ctx context.Context, br *bufio.Reader, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	// Step 3 will add encryption + traffic forwarding here.
-	return nil
+	// The very first FrameTypeData carries the destination address.
+	// We use a flag to know when we've parsed it.
+	destParsed := false
+	var link *transport.Link
+
+	for {
+		frame, err := session.ReadFrame(br)
+		if err != nil {
+			if link != nil {
+				common.Interrupt(link.Writer)
+			}
+			return errors.New("reflex inbound: failed to read frame").Base(err)
+		}
+
+		switch frame.Type {
+		case reflex.FrameTypeData:
+			if !destParsed {
+				// First data frame: parse destination + initial data.
+				addrType, addr, port, initialData, err := reflex.DecodeDestination(frame.Payload)
+				if err != nil {
+					return errors.New("reflex inbound: failed to decode destination").Base(err)
+				}
+				dest, err := buildDestination(addrType, addr, port)
+				if err != nil {
+					return errors.New("reflex inbound: invalid destination").Base(err)
+				}
+				destParsed = true
+
+				// Dispatch to upstream.
+				link, err = dispatcher.Dispatch(ctx, dest)
+				if err != nil {
+					return errors.New("reflex inbound: dispatch failed").Base(err)
+				}
+
+				// Start goroutine: upstream → client (encrypted frames).
+				go func() {
+					defer common.Interrupt(link.Reader)
+					for {
+						mb, err := link.Reader.ReadMultiBuffer()
+						if err != nil {
+							return
+						}
+						for _, b := range mb {
+							if err := session.WriteFrame(conn, reflex.FrameTypeData, b.Bytes()); err != nil {
+								b.Release()
+								return
+							}
+							b.Release()
+						}
+					}
+				}()
+
+				// Write initial data (if any) to upstream.
+				if len(initialData) > 0 {
+					buf := xbuf.FromBytes(initialData)
+					if err := link.Writer.WriteMultiBuffer(xbuf.MultiBuffer{buf}); err != nil {
+						return errors.New("reflex inbound: failed to write initial data").Base(err)
+					}
+				}
+			} else {
+				// Subsequent data frames: forward directly to upstream.
+				if link == nil {
+					return errors.New("reflex inbound: data frame before destination")
+				}
+				b := xbuf.FromBytes(frame.Payload)
+				if err := link.Writer.WriteMultiBuffer(xbuf.MultiBuffer{b}); err != nil {
+					return errors.New("reflex inbound: upstream write failed").Base(err)
+				}
+			}
+
+		case reflex.FrameTypePadding, reflex.FrameTypeTiming:
+			// Ignore control frames for now (Step 5).
+			continue
+
+		case reflex.FrameTypeClose:
+			if link != nil {
+				common.Close(link.Writer)
+			}
+			// Send Close frame back to acknowledge.
+			_ = session.WriteFrame(conn, reflex.FrameTypeClose, nil)
+			return nil
+
+		default:
+			return errors.New("reflex inbound: unknown frame type: ", frame.Type)
+		}
+	}
 }
 
 // ---- Minimal HTTP/1.1 request reader ----
@@ -250,3 +332,16 @@ func readHTTPRequest(br *bufio.Reader) (*parsedRequest, []byte, error) {
 // Silence unused import if rand isn't used elsewhere yet.
 var _ = rand.Reader
 var _ = json.Marshal
+
+func buildDestination(addrType uint8, addr []byte, port uint16) (net.Destination, error) {
+	netPort := net.Port(port)
+	switch addrType {
+	case reflex.AddrTypeIPv4, reflex.AddrTypeIPv6:
+		ip := net.IPAddress(addr)
+		return net.TCPDestination(ip, netPort), nil
+	case reflex.AddrTypeDomain:
+		return net.TCPDestination(net.DomainAddress(string(addr)), netPort), nil
+	default:
+		return net.Destination{}, errors.New("unknown address type: ", addrType)
+	}
+}
