@@ -118,11 +118,12 @@ func (x *Account) GetId() string {
 }
 
 type InboundConfig struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Clients       []*User                `protobuf:"bytes,1,rep,name=clients,proto3" json:"clients,omitempty"`
-	Fallback      *Fallback              `protobuf:"bytes,2,opt,name=fallback,proto3" json:"fallback,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Clients          []*User                `protobuf:"bytes,1,rep,name=clients,proto3" json:"clients,omitempty"`
+	Fallback         *Fallback              `protobuf:"bytes,2,opt,name=fallback,proto3" json:"fallback,omitempty"`
+	MorphingProfile  string                 `protobuf:"bytes,3,opt,name=morphing_profile,json=morphingProfile,proto3" json:"morphing_profile,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *InboundConfig) Reset() {
@@ -167,6 +168,13 @@ func (x *InboundConfig) GetFallback() *Fallback {
 		return x.Fallback
 	}
 	return nil
+}
+
+func (x *InboundConfig) GetMorphingProfile() string {
+	if x != nil {
+		return x.MorphingProfile
+	}
+	return ""
 }
 
 type Fallback struct {
@@ -214,12 +222,13 @@ func (x *Fallback) GetDest() uint32 {
 }
 
 type OutboundConfig struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Address       string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
-	Port          uint32                 `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"`
-	Id            string                 `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"` // UUID کلاینت
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Address         string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+	Port            uint32                 `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"`
+	Id              string                 `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"`
+	MorphingProfile string                 `protobuf:"bytes,4,opt,name=morphing_profile,json=morphingProfile,proto3" json:"morphing_profile,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *OutboundConfig) Reset() {
@@ -269,6 +278,13 @@ func (x *OutboundConfig) GetPort() uint32 {
 func (x *OutboundConfig) GetId() string {
 	if x != nil {
 		return x.Id
+	}
+	return ""
+}
+
+func (x *OutboundConfig) GetMorphingProfile() string {
+	if x != nil {
+		return x.MorphingProfile
 	}
 	return ""
 }

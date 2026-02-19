@@ -21,8 +21,9 @@ type ReflexFallbackConfig struct {
 }
 
 type ReflexInboundConfig struct {
-	Clients  []json.RawMessage     `json:"clients"`
-	Fallback *ReflexFallbackConfig `json:"fallback"`
+	Clients         []json.RawMessage     `json:"clients"`
+	Fallback        *ReflexFallbackConfig `json:"fallback"`
+	MorphingProfile string                `json:"morphing_profile"`
 }
 
 // Build implements Buildable
@@ -50,15 +51,18 @@ func (c *ReflexInboundConfig) Build() (proto.Message, error) {
 		}
 	}
 
+	config.MorphingProfile = c.MorphingProfile
+
 	return config, nil
 }
 
 // ---- Outbound ----
 
 type ReflexOutboundConfig struct {
-	Address string `json:"address"`
-	Port    uint32 `json:"port"`
-	Id      string `json:"id"`
+	Address         string `json:"address"`
+	Port            uint32 `json:"port"`
+	Id              string `json:"id"`
+	MorphingProfile string `json:"morphing_profile"`
 }
 
 // Build implements Buildable
@@ -72,9 +76,10 @@ func (c *ReflexOutboundConfig) Build() (proto.Message, error) {
 	}
 
 	config := &reflex.OutboundConfig{
-		Address: c.Address,
-		Port:    c.Port,
-		Id:      u.String(),
+		Address:         c.Address,
+		Port:            c.Port,
+		Id:              u.String(),
+		MorphingProfile: c.MorphingProfile,
 	}
 
 	return config, nil

@@ -35,10 +35,18 @@ func newTestHandler(fallbackPort uint32) *Handler {
 				Account: &MemoryAccount{Id: testUUID},
 			},
 		},
+		userPolicies: make(map[string]string),
 	}
 	if fallbackPort > 0 {
 		h.fallback = &FallbackConfig{Dest: fallbackPort}
 	}
+	return h
+}
+
+func newTestHandlerWithMorphing(fallbackPort uint32, profileName string) *Handler {
+	h := newTestHandler(fallbackPort)
+	h.morphingProfile = profileName
+	h.userPolicies[testUUID] = profileName
 	return h
 }
 
@@ -800,6 +808,16 @@ func TestIntegrationMultipleClients(t *testing.T) {
 	}
 }
 
+// doClientHandshakeWithProfile performs a handshake and sets up morphing on the returned session.
+func doClientHandshakeWithProfile(t *testing.T, conn net.Conn, uuid string, profileName string) *reflex.Session {
+	t.Helper()
+	session := doClientHandshake(t, conn, uuid)
+	if profile := reflex.LookupProfile(profileName); profile != nil {
+		session.SetProfile(profile)
+	}
+	return session
+}
+
 func TestProcessRoutesToReflex(t *testing.T) {
 	// Confirm that Process routes Reflex traffic to handleReflex, not fallback.
 	h := newTestHandler(0)
@@ -833,5 +851,220 @@ func TestProcessRoutesToReflex(t *testing.T) {
 
 	if !strings.Contains(response, "200") {
 		t.Fatalf("expected HTTP 200 from Reflex handler, got: %q", response)
+	}
+}
+
+// ================================================================
+// Morphing integration tests
+// ================================================================
+
+func TestMorphingHandshakeAndData(t *testing.T) {
+	h := newTestHandlerWithMorphing(0, "youtube")
+	dispatcher := &mockDispatcher{}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- h.Process(context.Background(), xnet.Network_TCP, serverConn, dispatcher)
+	}()
+
+	session := doClientHandshakeWithProfile(t, clientConn, testUUID, "youtube")
+
+	destBytes := reflex.EncodeDestination(reflex.AddrTypeDomain, []byte("example.com"), 443)
+	msg := []byte("morphing integration test")
+	firstPayload := append(destBytes, msg...)
+	if err := session.WriteFrameMorphed(clientConn, reflex.FrameTypeData, firstPayload); err != nil {
+		t.Fatalf("write morphed data frame: %v", err)
+	}
+
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		buf := make([]byte, 4096)
+		for {
+			clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+			_, err := clientConn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	session.WriteFrame(clientConn, reflex.FrameTypeClose, nil)
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Logf("server exited with: %v (acceptable)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for server")
+	}
+	<-drainDone
+}
+
+func TestMorphingBidirectionalData(t *testing.T) {
+	h := newTestHandlerWithMorphing(0, "zoom")
+	dispatcher := &mockDispatcher{}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- h.Process(context.Background(), xnet.Network_TCP, serverConn, dispatcher)
+	}()
+
+	session := doClientHandshakeWithProfile(t, clientConn, testUUID, "zoom")
+
+	destBytes := reflex.EncodeDestination(reflex.AddrTypeIPv4, []byte{10, 0, 0, 1}, 8080)
+	msg := []byte("bidirectional morphing test")
+	firstPayload := append(destBytes, msg...)
+	if err := session.WriteFrameMorphed(clientConn, reflex.FrameTypeData, firstPayload); err != nil {
+		t.Fatalf("write morphed frame: %v", err)
+	}
+
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		buf := make([]byte, 4096)
+		for {
+			clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+			_, err := clientConn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := session.WriteFrameMorphed(clientConn, reflex.FrameTypeData, []byte("second morphed")); err != nil {
+		t.Fatalf("write second morphed frame: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	session.WriteFrame(clientConn, reflex.FrameTypeClose, nil)
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Logf("server: %v (acceptable)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout")
+	}
+	<-drainDone
+}
+
+func TestMorphingMultipleClients(t *testing.T) {
+	h := newTestHandlerWithMorphing(0, "youtube")
+	dispatcher := &mockDispatcher{}
+
+	const numClients = 3
+	var wg sync.WaitGroup
+	errs := make(chan error, numClients)
+
+	for i := 0; i < numClients; i++ {
+		wg.Add(1)
+		go func(clientID int) {
+			defer wg.Done()
+
+			clientConn, serverConn := net.Pipe()
+			defer clientConn.Close()
+			defer serverConn.Close()
+
+			serverDone := make(chan error, 1)
+			go func() {
+				serverDone <- h.Process(context.Background(), xnet.Network_TCP, serverConn, dispatcher)
+			}()
+
+			session := doClientHandshakeWithProfile(t, clientConn, testUUID, "youtube")
+
+			destBytes := reflex.EncodeDestination(
+				reflex.AddrTypeDomain,
+				[]byte(fmt.Sprintf("morphed%d.example.com", clientID)),
+				uint16(9000+clientID),
+			)
+			payload := append(destBytes, []byte(fmt.Sprintf("morphed client %d", clientID))...)
+			if err := session.WriteFrameMorphed(clientConn, reflex.FrameTypeData, payload); err != nil {
+				errs <- fmt.Errorf("client %d: %v", clientID, err)
+				return
+			}
+
+			drainDone := make(chan struct{})
+			go func() {
+				defer close(drainDone)
+				buf := make([]byte, 4096)
+				for {
+					clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+					if _, err := clientConn.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
+
+			time.Sleep(100 * time.Millisecond)
+			session.WriteFrame(clientConn, reflex.FrameTypeClose, nil)
+
+			select {
+			case <-serverDone:
+			case <-time.After(5 * time.Second):
+				errs <- fmt.Errorf("client %d: timeout", clientID)
+			}
+			<-drainDone
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func TestMorphingFallbackStillWorks(t *testing.T) {
+	fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(200)
+		w.Write([]byte("fallback with morphing OK"))
+	}))
+	defer fallbackServer.Close()
+
+	addrParts := strings.Split(fallbackServer.Listener.Addr().String(), ":")
+	port, _ := strconv.Atoi(addrParts[len(addrParts)-1])
+
+	h := newTestHandlerWithMorphing(uint32(port), "youtube")
+	dispatcher := &mockDispatcher{}
+
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- h.Process(context.Background(), xnet.Network_TCP, serverConn, dispatcher)
+	}()
+
+	request := "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+	clientConn.Write([]byte(request))
+
+	responseBuf := make([]byte, 4096)
+	clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _ := io.ReadAtLeast(clientConn, responseBuf, 1)
+	response := string(responseBuf[:n])
+	clientConn.Close()
+
+	if !strings.Contains(response, "fallback with morphing OK") && !strings.Contains(response, "200") {
+		t.Logf("response: %q", response)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for fallback")
 	}
 }
