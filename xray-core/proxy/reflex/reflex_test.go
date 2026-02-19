@@ -20,19 +20,6 @@ func mustGenerateKey(t *testing.T) ([32]byte, [32]byte) {
 	return priv, pub
 }
 
-func mustSession(t *testing.T) *Session {
-	t.Helper()
-	key := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, key); err != nil {
-		t.Fatal(err)
-	}
-	s, err := NewSession(key)
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	return s
-}
-
 // ------------------------------------------------------------------ key exchange
 
 func TestGenerateKeyPair(t *testing.T) {

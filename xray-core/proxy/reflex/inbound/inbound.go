@@ -127,14 +127,6 @@ func isHTTPPostLike(data []byte) bool {
 	return string(data[:len(prefix)]) == prefix
 }
 
-// isReflexMagic checks for the optional magic number prefix "REFX".
-// Not used by default (magic number reduces stealth).
-func isReflexMagic(data []byte) bool {
-	if len(data) < 4 {
-		return false
-	}
-	return data[0] == 'R' && data[1] == 'E' && data[2] == 'F' && data[3] == 'X'
-}
 
 // ============================================================
 // Step 4: Fallback handler
@@ -156,7 +148,7 @@ func (pc *preloadedConn) Read(b []byte) (int, error) {
 func (h *Handler) handleFallback(ctx context.Context, br *bufio.Reader, conn stat.Connection) error {
 	if h.fallback == nil {
 		// No fallback configured: send a plausible HTTP response and close.
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		_, _ = conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return errors.New("reflex inbound: not a Reflex connection and no fallback configured")
 	}
 
@@ -166,7 +158,7 @@ func (h *Handler) handleFallback(ctx context.Context, br *bufio.Reader, conn sta
 		Port: int(h.fallback.Dest),
 	})
 	if err != nil {
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
 		return errors.New("reflex inbound: fallback dial failed to 127.0.0.1:", h.fallback.Dest).Base(err)
 	}
 	defer target.Close()
@@ -180,10 +172,10 @@ func (h *Handler) handleFallback(ctx context.Context, br *bufio.Reader, conn sta
 	go func() {
 		_, err := io.Copy(target, wrapped)
 		// Signal the target that we're done writing (triggers EOF on its reader).
-		target.CloseWrite()
+		_ = target.CloseWrite()
 		done <- err
 	}()
-	io.Copy(wrapped, target)
+	_, _ = io.Copy(wrapped, target)
 	<-done
 	return nil
 }
@@ -196,22 +188,22 @@ func (h *Handler) handleFallback(ctx context.Context, br *bufio.Reader, conn sta
 func (h *Handler) handleReflex(ctx context.Context, br *bufio.Reader, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	req, bodyBytes, err := readHTTPRequest(br)
 	if err != nil {
-		conn.Write([]byte(reflex.FallbackResponse))
+		_, _ = conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: not a valid HTTP request").Base(err)
 	}
 	if req.method != "POST" || req.path != "/api/v1/data" {
-		conn.Write([]byte(reflex.FallbackResponse))
+		_, _ = conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: unexpected method/path: ", req.method, " ", req.path)
 	}
 
 	rawPayload, err := reflex.UnwrapHTTPBody(bodyBytes)
 	if err != nil {
-		conn.Write([]byte(reflex.FallbackResponse))
+		_, _ = conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: bad handshake body").Base(err)
 	}
 	clientPayload, err := reflex.DecodeClientPayload(rawPayload)
 	if err != nil {
-		conn.Write([]byte(reflex.FallbackResponse))
+		_, _ = conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: bad client payload").Base(err)
 	}
 
@@ -221,7 +213,7 @@ func (h *Handler) handleReflex(ctx context.Context, br *bufio.Reader, conn stat.
 		diff = -diff
 	}
 	if diff > 120 {
-		conn.Write([]byte(reflex.FallbackResponse))
+		_, _ = conn.Write([]byte(reflex.FallbackResponse))
 		return errors.New("reflex inbound: timestamp too far off: ", diff, "s")
 	}
 
@@ -278,7 +270,7 @@ func (h *Handler) handleSession(
 		frame, err := session.ReadFrame(br)
 		if err != nil {
 			if link != nil {
-				common.Interrupt(link.Writer)
+				_ = common.Interrupt(link.Writer)
 			}
 			return errors.New("reflex inbound: failed to read frame").Base(err)
 		}
@@ -302,7 +294,7 @@ func (h *Handler) handleSession(
 				}
 
 				go func() {
-					defer common.Interrupt(link.Reader)
+					defer func() { _ = common.Interrupt(link.Reader) }()
 					for {
 						mb, err := link.Reader.ReadMultiBuffer()
 						if err != nil {

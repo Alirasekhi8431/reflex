@@ -1,0 +1,31 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "port": 443,
+      "protocol": "reflex",
+      "settings": {
+        "clients": [
+          {
+            "id": "12345678-1234-1234-1234-123456789abc",
+            "policy": "mimic-http2-api"
+          }
+        ],
+        "fallback": {
+          "dest": 8080
+        }
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}
