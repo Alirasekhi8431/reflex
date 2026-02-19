@@ -76,7 +76,7 @@ jobs:
         id: lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v2
+          version: v1.2
           working-directory: xray-core
           args: --timeout=5m
         continue-on-error: true
