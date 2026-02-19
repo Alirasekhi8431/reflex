@@ -64,7 +64,7 @@ func readHTTPResponse(br *bufio.Reader) ([]byte, error) {
 	}
 	var proto_, status string
 	var code int
-	fmt.Sscanf(line, "%s %d %s", &proto_, &code, &status)
+	_, _ = fmt.Sscanf(line, "%s %d %s", &proto_, &code, &status)
 	if code != 200 {
 		return nil, fmt.Errorf("reflex: server returned HTTP %d", code)
 	}
@@ -159,7 +159,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	// Goroutine: server → client (decrypt frames, write to link).
 	downlinkErr := make(chan error, 1)
 	go func() {
-		defer common.Interrupt(link.Writer)
+		defer func() { _ = common.Interrupt(link.Writer) }()
 		for {
 			frame, err := session.ReadFrame(br)
 			if err != nil {
@@ -202,27 +202,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 			if err := session.WriteFrame(conn, reflex.FrameTypeData, frameData); err != nil {
 				b.Release()
-				common.Interrupt(link.Reader)
+				_ = common.Interrupt(link.Reader)
 				return errors.New("reflex outbound: write frame failed").Base(err)
 			}
 			b.Release()
 		}
 	}
-}
-
-// pipeTraffic is a simple TCP bidirectional copy (placeholder until Step 3).
-func pipeTraffic(conn net.Conn, link *transport.Link) error {
-	uplinkDone := make(chan error, 1)
-	go func() {
-		uplinkDone <- buf.Copy(link.Reader, buf.NewWriter(conn), nil)
-		common.Interrupt(buf.NewWriter(conn))
-	}()
-	downErr := buf.Copy(buf.NewReader(conn), link.Writer, nil)
-	upErr := <-uplinkDone
-	if downErr != nil {
-		return downErr
-	}
-	return upErr
 }
 
 // uuidStringToBytes converts "xxxxxxxx-xxxx-..." string to 16 bytes.
