@@ -66,7 +66,10 @@ func readHTTPResponse(br *bufio.Reader) ([]byte, error) {
 	}
 	var proto_, status string
 	var code int
-	_, _ = fmt.Sscanf(line, "%s %d %s", &proto_, &code, &status)
+	n, _ := fmt.Sscanf(line, "%s %d %s", &proto_, &code, &status)
+	if n < 2 {
+		return nil, fmt.Errorf("reflex: malformed HTTP status line: %q", line)
+	}
 	if code != 200 {
 		return nil, fmt.Errorf("reflex: server returned HTTP %d", code)
 	}
