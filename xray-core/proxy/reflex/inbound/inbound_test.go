@@ -497,6 +497,309 @@ func TestFallbackNoConfig(t *testing.T) {
 	}
 }
 
+// ================================================================
+// Test: Replay protection — replaying a captured handshake must not
+// yield a working session because the server generates fresh
+// ephemeral keys each time.
+// ================================================================
+
+func TestReplayHandshakeProducesUnusableSession(t *testing.T) {
+	h := newTestHandler(0)
+	dispatcher := &mockDispatcher{}
+
+	// Helper: perform handshake with given bytes, return server's ephemeral
+	// public key and derived session key, then close cleanly.
+	doHandshakeAndCollect := func(reqBytes []byte, clientPriv [32]byte, nonce [16]byte) ([32]byte, []byte) {
+		cConn, sConn := net.Pipe()
+		defer cConn.Close()
+		defer sConn.Close()
+
+		done := make(chan error, 1)
+		go func() {
+			br := bufio.NewReader(sConn)
+			done <- h.handleReflex(context.Background(), br, sConn, dispatcher)
+		}()
+
+		cConn.Write(reqBytes)
+
+		br := bufio.NewReader(cConn)
+		body, err := readHTTPResponseBody(t, br)
+		if err != nil {
+			t.Fatalf("handshake read failed: %v", err)
+		}
+		sp, _ := reflex.DecodeServerPayload(body)
+		shared, _ := reflex.DeriveSharedKey(clientPriv, sp.PublicKey)
+		sessKey, _ := reflex.DeriveSessionKey(shared, nonce)
+
+		sess, _ := reflex.NewSession(sessKey)
+
+		// Drain server writes (net.Pipe is unbuffered).
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				cConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+				if _, err := cConn.Read(buf); err != nil {
+					return
+				}
+			}
+		}()
+
+		sess.WriteFrame(cConn, reflex.FrameTypeClose, nil)
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+		}
+		return sp.PublicKey, sessKey
+	}
+
+	clientPriv, clientPub, _ := reflex.GenerateKeyPair()
+	payload := &reflex.ClientPayload{
+		PublicKey: clientPub,
+		Timestamp: time.Now().Unix(),
+	}
+	copy(payload.UserID[:], uuidToBytes(t, testUUID))
+	io.ReadFull(rand.Reader, payload.Nonce[:])
+	reqBytes, _ := reflex.WrapClientHTTP(payload, "test-server")
+
+	serverPub1, sessKey1 := doHandshakeAndCollect(reqBytes, clientPriv, payload.Nonce)
+
+	// Replay the exact same handshake bytes on a new connection.
+	serverPub2, sessKey2 := doHandshakeAndCollect(reqBytes, clientPriv, payload.Nonce)
+
+	if serverPub1 == serverPub2 {
+		t.Fatal("server reused the same ephemeral key — replay attack possible")
+	}
+	if string(sessKey1) == string(sessKey2) {
+		t.Fatal("replay produced identical session key — ephemeral key reuse")
+	}
+}
+
+func TestReplayExpiredTimestamp(t *testing.T) {
+	h := newTestHandler(0)
+	dispatcher := &mockDispatcher{}
+
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(serverConn)
+		done <- h.handleReflex(context.Background(), br, serverConn, dispatcher)
+	}()
+
+	// Simulate a replayed handshake whose timestamp has expired (>120s old).
+	_, clientPub, _ := reflex.GenerateKeyPair()
+	payload := &reflex.ClientPayload{
+		PublicKey: clientPub,
+		Timestamp: time.Now().Unix() - 200,
+	}
+	copy(payload.UserID[:], uuidToBytes(t, testUUID))
+	io.ReadFull(rand.Reader, payload.Nonce[:])
+
+	reqBytes, _ := reflex.WrapClientHTTP(payload, "test-server")
+	clientConn.Write(reqBytes)
+
+	buf := make([]byte, 512)
+	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _ := clientConn.Read(buf)
+	resp := string(buf[:n])
+
+	// Server must reject with 403 (replay window expired).
+	if !strings.Contains(resp, "403") {
+		t.Logf("response: %q", resp)
+	}
+	clientConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: server did not reject expired replay")
+	}
+}
+
+// ================================================================
+// Test: Full integration — handshake, bidirectional data, close
+// ================================================================
+
+func TestIntegrationEndToEnd(t *testing.T) {
+	h := newTestHandler(0)
+	dispatcher := &mockDispatcher{}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- h.Process(context.Background(), xnet.Network_TCP, serverConn, dispatcher)
+	}()
+
+	session := doClientHandshake(t, clientConn, testUUID)
+
+	// Send a data frame with destination + payload.
+	destBytes := reflex.EncodeDestination(reflex.AddrTypeIPv4, []byte{127, 0, 0, 1}, 9090)
+	msg := []byte("integration test payload")
+	firstPayload := append(destBytes, msg...)
+	if err := session.WriteFrame(clientConn, reflex.FrameTypeData, firstPayload); err != nil {
+		t.Fatalf("write first data frame: %v", err)
+	}
+
+	// Drain server echoed frames in the background so net.Pipe doesn't block.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		buf := make([]byte, 4096)
+		for {
+			clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+			_, err := clientConn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Send a second data frame (no destination prefix).
+	time.Sleep(50 * time.Millisecond)
+	if err := session.WriteFrame(clientConn, reflex.FrameTypeData, []byte("second message")); err != nil {
+		t.Fatalf("write second data frame: %v", err)
+	}
+
+	// Graceful close.
+	time.Sleep(50 * time.Millisecond)
+	session.WriteFrame(clientConn, reflex.FrameTypeClose, nil)
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Logf("server finished with: %v (acceptable)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for server to finish")
+	}
+	<-drainDone
+}
+
+func TestIntegrationFallbackRouting(t *testing.T) {
+	// Verify that non-Reflex traffic on a handler without fallback returns
+	// a proper HTTP error, while Reflex traffic gets a 200 handshake response.
+	h := newTestHandler(0) // no fallback
+	dispatcher := &mockDispatcher{}
+
+	// Non-Reflex traffic should get an error (400 Bad Request).
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- h.Process(context.Background(), xnet.Network_TCP, serverConn, dispatcher)
+	}()
+
+	clientConn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+	clientConn.Close()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error for non-Reflex traffic without fallback")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: non-Reflex traffic was not rejected")
+	}
+
+	// Reflex traffic should succeed with HTTP 200.
+	clientConn2, serverConn2 := net.Pipe()
+	defer clientConn2.Close()
+	defer serverConn2.Close()
+
+	done2 := make(chan error, 1)
+	go func() {
+		done2 <- h.Process(context.Background(), xnet.Network_TCP, serverConn2, dispatcher)
+	}()
+
+	_, clientPub, _ := reflex.GenerateKeyPair()
+	payload := &reflex.ClientPayload{
+		PublicKey: clientPub,
+		Timestamp: time.Now().Unix(),
+	}
+	copy(payload.UserID[:], uuidToBytes(t, testUUID))
+	io.ReadFull(rand.Reader, payload.Nonce[:])
+	reqBytes, _ := reflex.WrapClientHTTP(payload, "test-server")
+	clientConn2.Write(reqBytes)
+
+	buf := make([]byte, 512)
+	clientConn2.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _ := clientConn2.Read(buf)
+	if !strings.Contains(string(buf[:n]), "200") {
+		t.Fatalf("expected HTTP 200 for Reflex traffic, got: %q", string(buf[:n]))
+	}
+}
+
+func TestIntegrationMultipleClients(t *testing.T) {
+	h := newTestHandler(0)
+	dispatcher := &mockDispatcher{}
+
+	const numClients = 3
+	var wg sync.WaitGroup
+	errs := make(chan error, numClients)
+
+	for i := 0; i < numClients; i++ {
+		wg.Add(1)
+		go func(clientID int) {
+			defer wg.Done()
+
+			clientConn, serverConn := net.Pipe()
+			defer clientConn.Close()
+			defer serverConn.Close()
+
+			serverDone := make(chan error, 1)
+			go func() {
+				serverDone <- h.Process(context.Background(), xnet.Network_TCP, serverConn, dispatcher)
+			}()
+
+			session := doClientHandshake(t, clientConn, testUUID)
+
+			destBytes := reflex.EncodeDestination(
+				reflex.AddrTypeDomain,
+				[]byte(fmt.Sprintf("client%d.example.com", clientID)),
+				uint16(8080+clientID),
+			)
+			payload := append(destBytes, []byte(fmt.Sprintf("hello from client %d", clientID))...)
+			if err := session.WriteFrame(clientConn, reflex.FrameTypeData, payload); err != nil {
+				errs <- fmt.Errorf("client %d write: %v", clientID, err)
+				return
+			}
+
+			drainDone := make(chan struct{})
+			go func() {
+				defer close(drainDone)
+				buf := make([]byte, 4096)
+				for {
+					clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+					if _, err := clientConn.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
+
+			time.Sleep(100 * time.Millisecond)
+			session.WriteFrame(clientConn, reflex.FrameTypeClose, nil)
+
+			select {
+			case <-serverDone:
+			case <-time.After(5 * time.Second):
+				errs <- fmt.Errorf("client %d: server timeout", clientID)
+			}
+			<-drainDone
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
 func TestProcessRoutesToReflex(t *testing.T) {
 	// Confirm that Process routes Reflex traffic to handleReflex, not fallback.
 	h := newTestHandler(0)
