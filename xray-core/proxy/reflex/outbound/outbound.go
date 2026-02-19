@@ -25,8 +25,9 @@ import (
 )
 
 type Handler struct {
-	server *protocol.ServerSpec
-	pm     policy.Manager
+	server          *protocol.ServerSpec
+	pm              policy.Manager
+	morphingProfile string
 }
 
 func init() {
@@ -51,8 +52,9 @@ func New(ctx context.Context, config *reflex.OutboundConfig) (*Handler, error) {
 	v := core.MustFromContext(ctx)
 
 	return &Handler{
-		server: spec,
-		pm:     v.GetFeature(policy.ManagerType()).(policy.Manager),
+		server:          spec,
+		pm:              v.GetFeature(policy.ManagerType()).(policy.Manager),
+		morphingProfile: config.MorphingProfile,
 	}, nil
 }
 
@@ -141,14 +143,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("reflex outbound: KDF failed").Base(err)
 	}
 
-	// ---- Session (Step 3) ----
+	// ---- Session (Step 3 + Step 5 morphing) ----
 	session, err := reflex.NewSession(sessionKey)
 	if err != nil {
 		return errors.New("reflex outbound: failed to create session").Base(err)
 	}
+	if profile := reflex.LookupProfile(h.morphingProfile); profile != nil {
+		session.SetProfile(profile)
+	}
 
 	// Build the destination prefix for the first data frame.
-	// Extract target from the session context outbound info.
 	outbounds := session_pkg.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		return errors.New("reflex outbound: no outbound context")
@@ -161,7 +165,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	go func() {
 		defer func() { _ = common.Interrupt(link.Writer) }()
 		for {
-			frame, err := session.ReadFrame(br)
+			frame, err := session.ReadFrameMorphed(br)
 			if err != nil {
 				downlinkErr <- err
 				return
@@ -177,7 +181,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				downlinkErr <- nil
 				return
 			case reflex.FrameTypePadding, reflex.FrameTypeTiming:
-				// ignore
+				// control frames handled by ReadFrameMorphed or ignored
 			}
 		}
 	}()
@@ -187,20 +191,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	for {
 		mb, err := link.Reader.ReadMultiBuffer()
 		if err != nil {
-			// Uplink done — send Close frame and wait for downlink.
 			_ = session.WriteFrame(conn, reflex.FrameTypeClose, nil)
 			return <-downlinkErr
 		}
 		for _, b := range mb {
 			var frameData []byte
 			if firstFrame {
-				// Prepend destination to the first frame's payload.
 				frameData = append(destBytes, b.Bytes()...)
 				firstFrame = false
 			} else {
 				frameData = b.Bytes()
 			}
-			if err := session.WriteFrame(conn, reflex.FrameTypeData, frameData); err != nil {
+			if err := session.WriteFrameMorphed(conn, reflex.FrameTypeData, frameData); err != nil {
 				b.Release()
 				_ = common.Interrupt(link.Reader)
 				return errors.New("reflex outbound: write frame failed").Base(err)

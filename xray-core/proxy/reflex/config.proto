@@ -15,6 +15,7 @@ message Account {
 message InboundConfig {
   repeated User clients = 1;
   Fallback fallback = 2;
+  string morphing_profile = 3;
 }
 
 message Fallback {
@@ -25,4 +26,5 @@ message OutboundConfig {
   string address = 1;
   uint32 port = 2;
   string id = 3;  // UUID کلاینت
+  string morphing_profile = 4;
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -43,6 +44,7 @@ type Session struct {
 	readNonce  uint64
 	writeNonce uint64
 	writeMu    sync.Mutex
+	profile    *TrafficProfile
 }
 
 func NewSession(sessionKey []byte) (*Session, error) {
@@ -113,6 +115,74 @@ func (s *Session) WriteFrame(w io.Writer, frameType uint8, data []byte) error {
 		return fmt.Errorf("reflex: failed to write frame payload: %w", err)
 	}
 	return nil
+}
+
+// ---- Morphing support ----
+
+// SetProfile enables traffic morphing on this session with the given profile.
+// Both sides of the connection must use the same setting.
+func (s *Session) SetProfile(p *TrafficProfile) {
+	s.profile = p
+}
+
+// Profile returns the current traffic profile, or nil if morphing is disabled.
+func (s *Session) Profile() *TrafficProfile {
+	return s.profile
+}
+
+// WriteFrameMorphed writes a frame with traffic morphing applied.
+// For FrameTypeData frames when a profile is set, the data is padded to a
+// target size sampled from the profile's packet-size distribution, and an
+// inter-packet delay is injected. Non-data frames and sessions without a
+// profile delegate to WriteFrame unchanged.
+func (s *Session) WriteFrameMorphed(w io.Writer, frameType uint8, data []byte) error {
+	if frameType != FrameTypeData || s.profile == nil {
+		return s.WriteFrame(w, frameType, data)
+	}
+
+	targetSize := s.profile.GetPacketSize()
+	maxData := targetSize - 2 // 2-byte length prefix
+	if maxData < 1 {
+		maxData = 1
+	}
+
+	if len(data) > maxData {
+		morphed := BuildMorphedPayload(data[:maxData], targetSize)
+		if err := s.WriteFrame(w, frameType, morphed); err != nil {
+			return err
+		}
+		if delay := s.profile.GetDelay(); delay > 0 {
+			time.Sleep(delay)
+		}
+		return s.WriteFrameMorphed(w, frameType, data[maxData:])
+	}
+
+	morphed := BuildMorphedPayload(data, targetSize)
+	if err := s.WriteFrame(w, frameType, morphed); err != nil {
+		return err
+	}
+	if delay := s.profile.GetDelay(); delay > 0 {
+		time.Sleep(delay)
+	}
+	return nil
+}
+
+// ReadFrameMorphed reads a frame and strips morphing padding from data
+// frames when a profile is set.
+func (s *Session) ReadFrameMorphed(r io.Reader) (*Frame, error) {
+	frame, err := s.ReadFrame(r)
+	if err != nil {
+		return nil, err
+	}
+	if frame.Type != FrameTypeData || s.profile == nil {
+		return frame, nil
+	}
+	actual, err := StripMorphedPayload(frame.Payload)
+	if err != nil {
+		return nil, err
+	}
+	frame.Payload = actual
+	return frame, nil
 }
 
 // ---- Destination encoding helpers (used in first FrameTypeData) ----

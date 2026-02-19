@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,8 +29,10 @@ import (
 // ---- Types (unchanged) ----
 
 type Handler struct {
-	clients  []*protocol.MemoryUser
-	fallback *FallbackConfig
+	clients         []*protocol.MemoryUser
+	fallback        *FallbackConfig
+	morphingProfile string
+	userPolicies    map[string]string // uuid → policy (morphing profile name)
 }
 
 type MemoryAccount struct {
@@ -66,13 +69,18 @@ func init() {
 
 func New(ctx context.Context, config *reflex.InboundConfig) (proxy.Inbound, error) {
 	handler := &Handler{
-		clients: make([]*protocol.MemoryUser, 0, len(config.Clients)),
+		clients:         make([]*protocol.MemoryUser, 0, len(config.Clients)),
+		morphingProfile: config.MorphingProfile,
+		userPolicies:    make(map[string]string),
 	}
 	for _, client := range config.Clients {
 		handler.clients = append(handler.clients, &protocol.MemoryUser{
 			Email:   client.Id,
 			Account: &MemoryAccount{Id: client.Id},
 		})
+		if client.Policy != "" {
+			handler.userPolicies[client.Id] = client.Policy
+		}
 	}
 	if config.Fallback != nil {
 		handler.fallback = &FallbackConfig{Dest: config.Fallback.Dest}
@@ -245,7 +253,15 @@ func (h *Handler) handleReflex(ctx context.Context, br *bufio.Reader, conn stat.
 		return errors.New("reflex inbound: failed to send handshake response").Base(err)
 	}
 
-	return h.handleSession(ctx, br, conn, dispatcher, sessionKey, user)
+	var profile *reflex.TrafficProfile
+	if policy, ok := h.userPolicies[user.Email]; ok {
+		profile = reflex.LookupProfile(policy)
+	}
+	if profile == nil && h.morphingProfile != "" {
+		profile = reflex.LookupProfile(h.morphingProfile)
+	}
+
+	return h.handleSession(ctx, br, conn, dispatcher, sessionKey, user, profile)
 }
 
 // ---- Session (unchanged from Step 3) ----
@@ -257,17 +273,21 @@ func (h *Handler) handleSession(
 	dispatcher routing.Dispatcher,
 	sessionKey []byte,
 	user *protocol.MemoryUser,
+	profile *reflex.TrafficProfile,
 ) error {
 	session, err := reflex.NewSession(sessionKey)
 	if err != nil {
 		return errors.New("reflex inbound: failed to create session").Base(err)
+	}
+	if profile != nil {
+		session.SetProfile(profile)
 	}
 
 	destParsed := false
 	var link *transport.Link
 
 	for {
-		frame, err := session.ReadFrame(br)
+		frame, err := session.ReadFrameMorphed(br)
 		if err != nil {
 			if link != nil {
 				_ = common.Interrupt(link.Writer)
@@ -301,7 +321,7 @@ func (h *Handler) handleSession(
 							return
 						}
 						for _, b := range mb {
-							if err := session.WriteFrame(conn, reflex.FrameTypeData, b.Bytes()); err != nil {
+							if err := session.WriteFrameMorphed(conn, reflex.FrameTypeData, b.Bytes()); err != nil {
 								b.Release()
 								return
 							}
@@ -326,8 +346,17 @@ func (h *Handler) handleSession(
 				}
 			}
 
-		case reflex.FrameTypePadding, reflex.FrameTypeTiming:
-			continue
+		case reflex.FrameTypePadding:
+			if profile != nil && len(frame.Payload) >= 2 {
+				targetSize := int(binary.BigEndian.Uint16(frame.Payload[:2]))
+				profile.SetNextPacketSize(targetSize)
+			}
+
+		case reflex.FrameTypeTiming:
+			if profile != nil && len(frame.Payload) >= 8 {
+				delayMs := binary.BigEndian.Uint64(frame.Payload[:8])
+				profile.SetNextDelay(time.Duration(delayMs) * time.Millisecond)
+			}
 
 		case reflex.FrameTypeClose:
 			if link != nil {
