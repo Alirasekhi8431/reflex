@@ -188,7 +188,7 @@ func BuildMorphedPayload(data []byte, targetSize int) []byte {
 	binary.BigEndian.PutUint16(morphed[:2], uint16(len(data)))
 	copy(morphed[2:], data)
 	if padStart := 2 + len(data); padStart < targetSize {
-		rand.Read(morphed[padStart:])
+		_, _ = rand.Read(morphed[padStart:])
 	}
 	return morphed
 }
