@@ -1,0 +1,209 @@
+name: Grade PR
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: grade-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    outputs:
+      build_ok: ${{ steps.out.outputs.build_ok }}
+      test_pass: ${{ steps.out.outputs.test_pass }}
+      coverage_pct: ${{ steps.out.outputs.coverage_pct }}
+      lint_pass: ${{ steps.out.outputs.lint_pass }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: xray-core/go.mod
+          cache-dependency-path: xray-core/go.sum
+
+      - name: Init resources
+        run: |
+          mkdir -p xray-core/resources
+          [ -s xray-core/resources/geoip.dat ] || touch xray-core/resources/geoip.dat
+          [ -s xray-core/resources/geosite.dat ] || touch xray-core/resources/geosite.dat
+
+      - name: Build
+        id: build
+        working-directory: xray-core
+        run: |
+          if go build -o xray ./main 2>/dev/null; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "ok=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Test
+        id: test
+        working-directory: xray-core
+        run: |
+          pass=false
+          if [ -d proxy/reflex ]; then
+            go test -timeout 5m -coverprofile=coverage.out -covermode=atomic ./proxy/reflex/... ./tests/... 2>/dev/null && pass=true
+          else
+            go test -timeout 2m -coverprofile=coverage.out -covermode=atomic ./tests/... 2>/dev/null && pass=true
+          fi
+          [ -f coverage.out ] || touch coverage.out
+          echo "pass=$pass" >> $GITHUB_OUTPUT
+
+      - name: Coverage
+        id: coverage
+        working-directory: xray-core
+        run: |
+          if [ -f coverage.out ]; then
+            pct=$(go tool cover -func=coverage.out 2>/dev/null | grep total | awk '{print int($3)}')
+            echo "pct=${pct:-0}" >> $GITHUB_OUTPUT
+          else
+            echo "pct=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Lint
+        id: lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2
+          working-directory: xray-core
+          args: --timeout=5m
+        continue-on-error: true
+
+      - name: Set outputs
+        id: out
+        run: |
+          echo "build_ok=${{ steps.build.outputs.ok }}" >> $GITHUB_OUTPUT
+          echo "test_pass=${{ steps.test.outputs.pass }}" >> $GITHUB_OUTPUT
+          echo "coverage_pct=${{ steps.coverage.outputs.pct }}" >> $GITHUB_OUTPUT
+          echo "lint_pass=${{ steps.lint.outcome == 'success' }}" >> $GITHUB_OUTPUT
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: xray-core/coverage.out
+        if: always()
+
+  grade:
+    needs: [build-test]
+    if: always() && needs.build-test.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use template grade script
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin "${{ github.base_ref || 'main' }}"
+          git show origin/${{ github.base_ref || 'main' }}:.github/scripts/grade-reflex.sh > .github/scripts/grade-reflex.sh 2>/dev/null || true
+
+      - name: Extract student IDs
+        id: extract
+        run: |
+          ids=""
+          if [ -f README.md ]; then
+            ids=$(grep -E '^\s*[-*]\s+[0-9]{8,}\s+[—\-]' README.md 2>/dev/null | grep -oE '[0-9]{8,}' | sort -u | tr '\n' ',' | sed 's/,$//')
+          fi
+          if [ -n "$ids" ]; then
+            id="$ids"
+          else
+            BRANCH="${{ github.head_ref || 'main' }}"
+            BODY="${{ github.event.pull_request.body || '' }}"
+            if echo "$BRANCH" | grep -qE 'student-([0-9]+)|.*-([0-9]{8,})'; then
+              id=$(echo "$BRANCH" | grep -oE '[0-9]{8,}' | head -1)
+            elif echo "$BODY" | grep -qiE 'student id[ \t:]+[0-9]+|شماره دانشجویی[ \t:]+[0-9]+'; then
+              id=$(echo "$BODY" | grep -oiE 'student id[ \t:]+[0-9]+|شماره دانشجویی[ \t:]+[0-9]+' | grep -oE '[0-9]+' | head -1)
+            elif [ -f README.md ]; then
+              id=$(grep -iE 'شماره دانشجویی|student id' README.md 2>/dev/null | grep -oE '[0-9]{8,}' | head -1)
+            else
+              id="unknown"
+            fi
+          fi
+          echo "id=${id:-unknown}" >> $GITHUB_OUTPUT
+
+      - name: Grade
+        id: grade
+        env:
+          BUILD_OK: ${{ needs.build-test.outputs.build_ok }}
+          TEST_PASS: ${{ needs.build-test.outputs.test_pass }}
+          COVERAGE_PCT: ${{ needs.build-test.outputs.coverage_pct }}
+          LINT_PASS: ${{ needs.build-test.outputs.lint_pass }}
+          STUDENT_ID: ${{ steps.extract.outputs.id }}
+        run: |
+          chmod +x .github/scripts/grade-reflex.sh
+          ./.github/scripts/grade-reflex.sh > grades.json 2>/dev/null || echo '{"studentId":"unknown","step1":0,"step2":0,"step3":0,"step4":0,"step5":0,"unitTest":0,"integration":0,"cleanCode":0,"report":0,"total":0,"buildOk":false,"testsPass":false,"lintPass":false,"coverage":0}' > grades.json
+          echo "json<<EOF" >> $GITHUB_OUTPUT
+          cat grades.json >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload grades
+        uses: actions/upload-artifact@v4
+        with:
+          name: grades-output
+          path: grades.json
+
+  comment-pr:
+    needs: [grade]
+    if: github.event_name == 'pull_request' && always() && needs.grade.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download grades
+        uses: actions/download-artifact@v4
+        with:
+          name: grades-output
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const grades = JSON.parse(fs.readFileSync('grades.json', 'utf8'));
+            const buildOk = grades.buildOk === true;
+            const testPass = grades.testsPass === true;
+            const lintPass = grades.lintPass === true;
+            const cov = grades.coverage || 0;
+            const body = `## grading done
+            <!-- reflex-grading -->
+
+            | Step1 | Step2 | Step3 | Step4 | Step5 | Unit | Integ | Code | Report | **Sum** |
+            |-------|-------|-------|-------|-------|------|-------|------|--------|---------|
+            | ${grades.step1} | ${grades.step2} | ${grades.step3} | ${grades.step4} | ${grades.step5} | ${grades.unitTest} | ${grades.integration} | ${grades.cleanCode} | ${grades.report} | **${grades.total}/105** |
+
+            build: ${buildOk ? 'ok' : 'failed'}. tests: ${testPass ? 'passed' : 'failed'}. lint: ${lintPass ? 'clean' : 'issues'}. coverage: ${cov}%.
+            student id(s): ${grades.studentId}
+
+            (download grades-output artifact for full json)`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const botComment = comments.find(c => c.body && c.body.includes('reflex-grading'));
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
