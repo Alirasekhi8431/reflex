@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -41,6 +42,7 @@ type Session struct {
 	aead       cipher.AEAD
 	readNonce  uint64
 	writeNonce uint64
+	writeMu    sync.Mutex
 }
 
 func NewSession(sessionKey []byte) (*Session, error) {
@@ -92,6 +94,8 @@ func (s *Session) ReadFrame(r io.Reader) (*Frame, error) {
 
 // WriteFrame encrypts data and writes a complete frame to w.
 func (s *Session) WriteFrame(w io.Writer, frameType uint8, data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	nonce := buildNonce(s.writeNonce)
 	s.writeNonce++
 
