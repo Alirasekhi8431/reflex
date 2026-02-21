@@ -54,11 +54,13 @@ jobs:
         run: |
           pass=false
           if [ -d proxy/reflex ]; then
-            go test -timeout 5m -coverprofile=coverage.out -covermode=atomic ./proxy/reflex/... ./tests/... 2>/dev/null && pass=true
+            go test -timeout 5m -coverprofile=coverage.out -covermode=atomic -json ./proxy/reflex/... ./tests/... > test_result.json 2>&1; ec=$?
           else
-            go test -timeout 2m -coverprofile=coverage.out -covermode=atomic ./tests/... 2>/dev/null && pass=true
+            go test -timeout 2m -coverprofile=coverage.out -covermode=atomic -json ./tests/... > test_result.json 2>&1; ec=$?
           fi
+          [ $ec -eq 0 ] && pass=true
           [ -f coverage.out ] || touch coverage.out
+          [ -f test_result.json ] || echo '[]' > test_result.json
           echo "pass=$pass" >> $GITHUB_OUTPUT
 
       - name: Coverage
@@ -96,12 +98,39 @@ jobs:
           path: xray-core/coverage.out
         if: always()
 
+      - name: Upload test result
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-result
+          path: xray-core/test_result.json
+        if: always()
+
   grade:
     needs: [build-test]
     if: always() && needs.build-test.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download test result
+        uses: actions/download-artifact@v4
+        with:
+          name: test-result
+        continue-on-error: true
+
+      - name: Ensure test result path for grading script
+        run: |
+          if [ -f test-result/xray-core/test_result.json ] && [ ! -f xray-core/test_result.json ]; then
+            mkdir -p xray-core
+            cp test-result/xray-core/test_result.json xray-core/test_result.json
+          fi
+          if [ -f test-result/test_result.json ] && [ ! -f xray-core/test_result.json ]; then
+            mkdir -p xray-core
+            cp test-result/test_result.json xray-core/test_result.json
+          fi
+
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
 
       - name: Use template grade script
         if: github.event_name == 'pull_request'
@@ -141,9 +170,10 @@ jobs:
           COVERAGE_PCT: ${{ needs.build-test.outputs.coverage_pct }}
           LINT_PASS: ${{ needs.build-test.outputs.lint_pass }}
           STUDENT_ID: ${{ steps.extract.outputs.id }}
+          TEST_RESULT_JSON: xray-core/test_result.json
         run: |
           chmod +x .github/scripts/grade-reflex.sh
-          ./.github/scripts/grade-reflex.sh > grades.json 2>/dev/null || echo '{"studentId":"unknown","step1":0,"step2":0,"step3":0,"step4":0,"step5":0,"unitTest":0,"integration":0,"cleanCode":0,"report":0,"total":0,"buildOk":false,"testsPass":false,"lintPass":false,"coverage":0}' > grades.json
+          ./.github/scripts/grade-reflex.sh > grades.json 2>/dev/null || echo '{"studentId":"unknown","step1":0,"step2":0,"step3":0,"step4":0,"step5":0,"unitTest":0,"integration":0,"cleanCode":0,"report":0,"total":0,"totalMax":105,"buildOk":false,"testsPass":false,"lintPass":false,"coverage":0,"gradingMode":"fallback"}' > grades.json
           echo "json<<EOF" >> $GITHUB_OUTPUT
           cat grades.json >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -174,6 +204,7 @@ jobs:
             const testPass = grades.testsPass === true;
             const lintPass = grades.lintPass === true;
             const cov = grades.coverage || 0;
+            const mode = grades.gradingMode || 'fallback';
             const body = `## grading done
             <!-- reflex-grading -->
 
@@ -182,6 +213,7 @@ jobs:
             | ${grades.step1} | ${grades.step2} | ${grades.step3} | ${grades.step4} | ${grades.step5} | ${grades.unitTest} | ${grades.integration} | ${grades.cleanCode} | ${grades.report} | **${grades.total}/105** |
 
             build: ${buildOk ? 'ok' : 'failed'}. tests: ${testPass ? 'passed' : 'failed'}. lint: ${lintPass ? 'clean' : 'issues'}. coverage: ${cov}%.
+            grading: **${mode}** (test-based = نمره بر اساس تست‌های پاس‌شده؛ fallback = بر اساس کد).
             student id(s): ${grades.studentId}
 
             (download grades-output artifact for full json)`;
